@@ -1,0 +1,2 @@
+# 统一以 LF 入库与检出：scripts/build.sh 要在 bash/WSL 下执行，CRLF 会让它失败。
+* text=auto eol=lf

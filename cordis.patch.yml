@@ -1,0 +1,20 @@
+# dsh-jev-warden 的装配与配置。注入器按目录重新注入这个包，改完 dev_reload_package dsh-jev-warden 即生效。
+- insert:
+    - id: dsh-jev-warden
+      name: '@dsh-external/dsh-jev-warden'
+      config:
+        # off 不判定 / shadow 只记不拦 / enforce 真拦。
+        enabled: true
+        mode: enforce
+        # deny 级规则阈值：0.8 = 只拦「明确出界」，边缘情形留给审批链。
+        threshold: 0.8
+        # ask 级规则阈值：比 deny 更高，因为每次误报都要用户点一次审批（实测无害诊断命令能到 0.89）。
+        askThreshold: 0.9
+        # Tier 0 确定性底线（归档 / vendor / 权威文件），没有简报也生效，0 次 Jev 调用。
+        guardPaths: true
+        # Tier 3 面向用户的最终回复「说人话」护栏：每轮最多回灌重写 1 次。
+        replyGuard: true
+        replyMaxRewrites: 1
+        # 在线热开关（改这个 JSON 立即生效，不用重载）：
+        #   ~/.dsh/jev-warden/config.json  ->  {"mode":"shadow","threshold":0.8}
+        # 判定流水：~/.dsh/jev-warden/warden-<YYYY-MM-DD>.jsonl
