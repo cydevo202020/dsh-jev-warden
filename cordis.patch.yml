@@ -10,6 +10,12 @@
         threshold: 0.8
         # ask 级规则阈值：比 deny 更高，因为每次误报都要用户点一次审批（实测无害诊断命令能到 0.89）。
         askThreshold: 0.9
+        # 把范围判定挂进闸门（dsh-jev）的那一次 Jev 调用：一次通过的工具调用只付一次往返。
+        # 闸门服务缺席时自动退回独立判定，行为不变。
+        mergeIntoGate: true
+        # session = 只认本轮会话期间冻结或改过的那一份（默认；旧简报不会扣住无关的新任务）。
+        # any = 目录下最新一份简报即当前（旧行为，显式开启才用）。
+        briefScope: session
         # Tier 0 确定性底线（归档 / vendor / 权威文件），没有简报也生效，0 次 Jev 调用。
         guardPaths: true
         # Tier 3 面向用户的最终回复「说人话」护栏：每轮最多回灌重写 1 次。

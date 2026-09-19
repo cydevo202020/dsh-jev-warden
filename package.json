@@ -1,16 +1,39 @@
 {
   "name": "@dsh-external/dsh-jev-warden",
-  "version": "0.0.1",
-  "description": "Jev warden: enforces agent-constraint skills (grill-me) by judging tool calls against the frozen brief and stopping clear out-of-scope actions.",
+  "version": "0.0.3",
+  "description": "Jev warden: enforces agent-constraint skills (grill-me, find-simplifications) by judging tool calls against the frozen brief, plus deterministic path guards and a plain-language reply guard.",
   "private": true,
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
   "files": [
     "lib",
+    "src",
     "cordis.patch.yml"
   ],
   "license": "BSD-3-Clause",
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cydevo202020/dsh-jev-warden.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cydevo202020/dsh-jev-warden/issues"
+  },
+  "homepage": "https://github.com/cydevo202020/dsh-jev-warden#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "typesafe",
+    "jev",
+    "grill-me",
+    "guardrail",
+    "agent-constraint",
+    "tool-gate"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -28,6 +51,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node tests/smoke.mjs && node tests/merge.mjs"
   }
 }

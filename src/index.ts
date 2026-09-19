@@ -29,6 +29,9 @@ export const inject = ['tools']
 
 const HOME_DIR = join(homedir(), '.dsh', 'jev-warden')
 
+/** 续期间隔：小于闸门注册表的有效期，保证活着的守卫插件不会因过期而静默失效。 */
+const CONTRIBUTION_REFRESH_MS = 60_000
+
 /**
  * 默认跳过的只读工具：这些调用不改变任何东西，按 grill-me 的四条铁律没有可违反的面，
  * 判它们只会给每次读取白加一次往返。需要连读取也判时把它设为空数组。
@@ -72,6 +75,20 @@ export interface Config {
   traceDir: string
   /** 运行时覆盖文件：顶层键浅合并到上面的配置，改完立即生效。空串关闭。 */
   runtimeConfigFile: string
+  /**
+   * 简报的适用范围：
+   * - `any`（默认）：工作目录下最新的一份 .md 即当前简报，跨会话继续生效；
+   * - `session`：只认本轮会话期间冻结/改过的简报，避免一个旧简报在同一个目录里长期拦住
+   *   后来完全无关的任务。
+   */
+  briefScope: string
+  /**
+   * 是否把范围判定挂进闸门（dsh-jev）的那一次 Jev 调用。
+   *
+   * 两个插件各挂一个 pre-execute 监听时，一次通过的工具调用要付两次网络往返。
+   * 合并后问题在同一次调用里问完，判定顺序与阈值都不变。闸门服务缺席时自动退回独立判定。
+   */
+  mergeIntoGate: boolean
 }
 
 export const Config = z.object({
@@ -90,6 +107,8 @@ export const Config = z.object({
   replyMaxRewrites: z.number().step(1).min(0).max(3).default(1),
   traceDir: z.string().default(HOME_DIR),
   runtimeConfigFile: z.string().default(join(HOME_DIR, 'config.json')),
+  briefScope: z.string().default('session'),
+  mergeIntoGate: z.boolean().default(true),
 })
 
 /** `tools/pre-execute` 上真正用到的字段。 */
@@ -111,16 +130,48 @@ interface JevService {
   ask(state: unknown, questions: WardenQuestion[], options?: { signal?: AbortSignal }): Promise<{ answers: Record<string, { type?: unknown; noul?: unknown }> }>
 }
 
+/**
+ * dsh-jev 提供的闸门服务的最小结构。
+ *
+ * 刻意用结构化类型而不是 import：守卫插件不硬依赖 dsh-jev，闸门缺席时走独立判定。
+ */
+interface GateContributionInputLike {
+  readonly name: string
+  readonly arguments: unknown
+  readonly agent?: { readonly session?: unknown }
+}
+
+/** 一次贡献：追加的问题、追加的 state 字段，以及拿到答案后的处置。 */
+interface GateContributionLike {
+  questions: WardenQuestion[]
+  state?: Record<string, unknown>
+  settle(
+    answers: Record<string, { type?: unknown; noul?: unknown }>,
+    failure?: string,
+  ): { kind: 'pass' | 'ask' | 'deny'; reason: string; effective: boolean } | undefined
+}
+
+/** 闸门服务：注册一个贡献者，返回注销函数。 */
+interface JevGateServiceLike {
+  contribute(id: string, factory: (input: GateContributionInputLike) => GateContributionLike | undefined): () => void
+}
+
 /** 从会话对象上尽力取会话 id 与工作目录。 */
-function sessionFacts(session: unknown): { id?: string; cwd?: string } {
+function sessionFacts(session: unknown): { id?: string; cwd?: string; startedAt?: number } {
   if (session === null || typeof session !== 'object') return {}
   const record = session as Record<string, unknown>
   const rawId = record['id']
-  const header = record['header']
-  const rawCwd = header !== null && typeof header === 'object' ? (header as Record<string, unknown>)['cwd'] : undefined
+  const header = record !== null && record['header'] !== null && typeof record['header'] === 'object'
+    ? record['header'] as Record<string, unknown>
+    : undefined
+  const rawCwd = header === undefined ? undefined : header['cwd']
+  // 会话起始时间：三种可能的位置都试一遍；读不到就不做时效判断（保持原行为）。
+  const candidates = [record['createdAt'], header?.['createdAt'], (record['meta'] as Record<string, unknown> | undefined)?.['createdAt']]
+  const startedAt = candidates.find((value): value is number => typeof value === 'number' && Number.isFinite(value))
   return {
     ...rawId === undefined || rawId === null ? {} : { id: String(rawId) },
     ...typeof rawCwd === 'string' && rawCwd.length > 0 ? { cwd: rawCwd } : {},
+    ...startedAt === undefined ? {} : { startedAt },
   }
 }
 
@@ -302,14 +353,19 @@ export function apply(ctx: Context, config: Config): void {
   }
   refresh()
 
-  /** 简报缓存：同目录同 mtime 不重复解析。 */
-  let briefCache: { dir: string; at: number; brief: WardenBrief | undefined } | undefined
+  /** 简报缓存：同目录同起始时间不重复解析。 */
+  let briefCache: { dir: string; at: number; startedAt: number | undefined; brief: WardenBrief | undefined } | undefined
   /**
    * 找冻结简报。显式 briefFile 优先；否则取 briefDir 下最新修改的 .md。
+   *
+   * 默认 `'session'`：只认本轮会话期间冻结或改过的那一份，工作目录下的旧简报不会在几天后
+   * 继续扣住一个完全无关的任务。`'any'` 保留旧行为（最新一份即当前），供"一份简报管整个目录"
+   * 的用法显式开启。
    * @param cwd - 会话工作目录。
-   * @returns 简报；找不到时为 undefined（此时闸门完全不介入）。
+   * @param startedAt - 会话起始时间；读不到时不做时效判断。
+   * @returns 简报；找不到或不适用时为 undefined（此时闸门完全不介入）。
    */
-  const resolveBrief = (cwd: string | undefined): WardenBrief | undefined => {
+  const resolveBrief = (cwd: string | undefined, startedAt?: number): WardenBrief | undefined => {
     if (cwd === undefined) return undefined
     if (runtime.briefFile.length > 0) {
       try {
@@ -320,7 +376,9 @@ export function apply(ctx: Context, config: Config): void {
     }
     const dir = join(cwd, runtime.briefDir)
     const now = Date.now()
-    if (briefCache !== undefined && briefCache.dir === dir && now - briefCache.at < 2_000) return briefCache.brief
+    if (briefCache !== undefined && briefCache.dir === dir && briefCache.startedAt === startedAt && now - briefCache.at < 2_000) {
+      return briefCache.brief
+    }
     let brief: WardenBrief | undefined
     try {
       let newest: { path: string; mtimeMs: number } | undefined
@@ -330,11 +388,16 @@ export function apply(ctx: Context, config: Config): void {
         const mtimeMs = statSync(path).mtimeMs
         if (newest === undefined || mtimeMs > newest.mtimeMs) newest = { path, mtimeMs }
       }
-      if (newest !== undefined) brief = { path: newest.path, text: readFileSync(newest.path, 'utf8').slice(0, runtime.maxBriefChars) }
+      // 配置对象可能没走 schema（测试与运行时覆盖都是直传），所以在这里兜默认值。
+      const stale = newest !== undefined && (runtime.briefScope ?? 'session') === 'session'
+        && startedAt !== undefined && newest.mtimeMs < startedAt
+      if (newest !== undefined && !stale) {
+        brief = { path: newest.path, text: readFileSync(newest.path, 'utf8').slice(0, runtime.maxBriefChars) }
+      }
     } catch {
       brief = undefined // 没有 .grill 目录就是没有简报。
     }
-    briefCache = { dir, at: now, brief }
+    briefCache = { dir, at: now, startedAt, brief }
     return brief
   }
 
@@ -344,6 +407,89 @@ export function apply(ctx: Context, config: Config): void {
       mkdirSync(runtime.traceDir, { recursive: true })
       appendFileSync(join(runtime.traceDir, 'warden-' + new Date().toISOString().slice(0, 10) + '.jsonl'), JSON.stringify(entry) + '\n')
     } catch { /* trace 是诊断用途 */ }
+  }
+
+  // ── 合并模式：把范围判定挂进闸门（dsh-jev）的那一次 Jev 调用 ────────────────
+  // 一次通过的工具调用原本要付两次网络往返（守卫一次、闸门一次）。合并后问题在同一次
+  // 调用里问完：输入只算一次，阈值与处置口径都不变。闸门服务缺席时自动退回独立判定。
+  // 记住"注册到的是哪一个闸门实例"。闸门热重载后会换一个新的服务对象，而它内部那份
+  // 贡献者表是空的；只记一个布尔值的话，本插件会以为自己还注册着，于是既不重新注册、
+  // 也不再自己判定 —— 护栏静默失效（2026-09-19 线上实测踩到）。
+  let registeredGate: JevGateServiceLike | undefined
+
+  /**
+   * 每次调用执行一次；返回 undefined 表示这次不参与判定。
+   * @param input - 闸门传来的待判调用。
+   * @returns 追加的问题、state 与结算函数。
+   */
+  const contributor = (input: GateContributionInputLike): GateContributionLike | undefined => {
+    refresh()
+    if (runtime.enabled === false || runtime.mode === 'off') return undefined
+    if (runtime.skipTools.includes(input.name)) return undefined
+    const facts = sessionFacts(input.agent?.session)
+    if (facts.id === undefined) return undefined
+    const brief = resolveBrief(facts.cwd, facts.startedAt)
+    if (brief === undefined) return undefined
+    const sets = declaredRuleSets(brief.text)
+    const questions = questionsOf(sets)
+    const request = latestUserTask(input.agent?.session)
+    const started = Date.now()
+    return {
+      questions,
+      state: wardenState(brief, input.name, input.arguments, facts.cwd, {
+        maxStringChars: runtime.maxArgChars,
+        ...request === undefined ? {} : { currentRequest: request },
+      }),
+      settle(answers, failure) {
+        let verdict: WardenVerdict | undefined
+        let error: string | undefined
+        if (failure !== undefined) error = failure
+        else {
+          const parsed = wardenAnswers(answers, questions)
+          if (parsed === undefined) error = 'Jev 返回的答案缺少 noul 字段'
+          else verdict = wardenVerdictOf(parsed, questions, runtime.threshold, runtime.askThreshold)
+        }
+        trace({
+          ts: new Date().toISOString(), session: facts.id, mode: runtime.mode, tool: input.name,
+          brief: brief.path, rulesets: sets.map((set) => set.id).join(','),
+          request: request === undefined ? null : request.slice(0, 120),
+          ms: Date.now() - started, merged: true,
+          verdict: verdict === undefined ? null : verdict.kind,
+          rule: verdict !== undefined && 'rule' in verdict ? verdict.rule : null,
+          reason: verdict === undefined ? null : verdict.reason,
+          error: error ?? null,
+        })
+        if (verdict === undefined) return undefined
+        return {
+          kind: verdict.kind,
+          reason: 'warden(' + ('rule' in verdict ? verdict.rule : '-') + '): ' + verdict.reason,
+          effective: runtime.mode === 'enforce',
+        }
+      },
+    }
+  }
+
+  /**
+   * 懒注册：闸门可能比本插件晚加载，所以在第一次用到的时候再绑；
+   * 闸门换了实例（热重载）时也要重新绑一次。
+   * @returns 本次调用是否可以交给闸门判定。
+   */
+  let registeredAt = 0
+  const ensureContribution = (): boolean => {
+    const gate = ctx.get('jevGate') as JevGateServiceLike | undefined
+    if (gate === undefined || typeof gate.contribute !== 'function') return false
+    const now = Date.now()
+    // 闸门换实例要重绑；同一实例上也要周期性续期——闸门把注册表放在进程级并按有效期淘汰
+    // 不活跃的条目，不续期的话本插件的判定会在几分钟后静默消失。
+    if (registeredGate === gate && now - registeredAt < CONTRIBUTION_REFRESH_MS) return true
+    try {
+      gate.contribute('dsh-jev-warden', contributor)
+      registeredGate = gate
+      registeredAt = now
+      return true
+    } catch {
+      return false // 注册失败就退回独立判定：护栏不能因为这个失效。
+    }
   }
 
   const onEvent = ctx as unknown as {
@@ -378,8 +524,10 @@ export function apply(ctx: Context, config: Config): void {
         : { kind: 'ask', reason: 'warden(' + guard.id + '): ' + guard.reason }
     }
 
-    const brief = resolveBrief(facts.cwd)
+    const brief = resolveBrief(facts.cwd, facts.startedAt)
     if (brief === undefined) return next()
+    // 合并模式：范围判定挂进闸门的那一次调用，这里只做 Tier 0，不再发第二次请求。
+    if (runtime.mergeIntoGate !== false && ensureContribution()) return next()
     const jev = ctx.get('jev') as JevService | undefined
     if (jev === undefined || !(await jev.available())) return next()
 
